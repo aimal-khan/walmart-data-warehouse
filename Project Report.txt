@@ -1,0 +1,321 @@
+# Walmart Near-Real-Time Data Warehouse Project Report
+
+## 1. Project Overview
+
+This project implements a near-real-time Data Warehouse (DW) system for Walmart using the HYBRIDJOIN algorithm for stream-relation joins. The system integrates transactional data with master data to enable timely business insights and decision-making.
+
+### Key Objectives:
+- Design and implement a star schema for Walmart's sales data
+- Implement the HYBRIDJOIN algorithm for near-real-time ETL processing
+- Enable dynamic data enrichment through stream-relation joins
+- Support multidimensional analysis through OLAP operations
+
+---
+
+## 2. Data Warehouse Schema
+
+### Star Schema Design
+
+The DW follows a star schema architecture with one fact table and five dimension tables:
+
+#### Fact Table: **fact_sales**
+- **Purpose**: Stores transactional sales data
+- **Measures**: quantity, total_amount
+- **Foreign Keys**: customer_key, product_key, date_key
+- **Grain**: One row per order-product combination
+
+#### Dimension Tables:
+
+**1. dim_customer**
+- Customer demographics and profile information
+- Attributes: Gender, Age, Occupation, City_Category, Stay_In_Current_City_Years, Marital_Status
+- Primary Key: customer_key
+- Business Key: Customer_ID
+
+**2. dim_product**
+- Product catalog with pricing and relationships
+- Attributes: Product_Category, price, store_key, supplier_key
+- Primary Key: product_key
+- Business Key: Product_ID
+
+**3. dim_date**
+- Time dimension for temporal analysis
+- Attributes: day_of_week, month, quarter, year, is_weekend, season
+- Primary Key: date_key
+- Supports drill-down from year → quarter → month → day
+
+**4. dim_store**
+- Store location information
+- Attributes: storeName
+- Primary Key: store_key
+- Business Key: storeID
+
+**5. dim_supplier**
+- Supplier information
+- Attributes: supplierName
+- Primary Key: supplier_key
+- Business Key: supplierID
+
+### Schema Advantages:
+- **Query Performance**: Denormalized structure enables fast aggregations
+- **Simplicity**: Easy to understand and navigate for business users
+- **Flexibility**: Supports various analytical perspectives (customer, product, time, location)
+- **Scalability**: Indexed foreign keys ensure efficient joins even with large datasets
+
+---
+
+## 3. HYBRIDJOIN Algorithm Explanation
+
+### Algorithm Overview
+
+HYBRIDJOIN is a stream-based join algorithm designed to efficiently join a continuous, potentially bursty data stream (S) with a large, disk-based relation (R). In our implementation, the stream consists of transactional data while R represents customer master data.
+
+### Key Components:
+
+**1. Stream Buffer (Queue)**
+- Temporarily holds incoming stream tuples
+- Prevents data loss during bursty arrivals
+- Implemented using Python's thread-safe Queue
+
+**2. Hash Table (H)**
+- Multi-map structure with 10,000 slots
+- Stores stream tuples hashed by join key (Customer_ID)
+- Each entry contains: (stream_tuple, queue_node_pointer)
+- Fixed size limits memory usage
+
+**3. Doubly-Linked Queue**
+- Maintains FIFO order of stream tuple keys
+- Enables efficient random deletions (O(1))
+- Each node stores: join_key, hash_table_entries, prev/next pointers
+
+**4. Disk Buffer**
+- Holds loaded partition of master data (500 tuples)
+- Simulates disk-based relation access
+- In our implementation, uses in-memory dictionary for customer data
+
+### Algorithm Workflow:
+
+**Step 1: Initialization**
+```
+- Initialize hash table with hS = 10,000 slots
+- Create empty doubly-linked queue
+- Set available slots w = hS
+- Start stream producer thread
+```
+
+**Step 2: Load Stream Tuples**
+```
+- Read up to w tuples from stream buffer
+- For each tuple:
+  * Hash Customer_ID to determine slot
+  * Insert tuple into hash table at slot
+  * Add Customer_ID to queue (FIFO)
+  * Store queue node pointer in hash entry
+- Reset w = 0
+```
+
+**Step 3: Load Disk Partition**
+```
+- Get oldest Customer_ID from queue head
+- Load matching customer data from master data
+- Store in disk buffer (partition size vP = 500)
+```
+
+**Step 4: Probe and Join**
+```
+- For each tuple in disk buffer:
+  * Hash join key to find slot
+  * Probe hash table at slot
+  * For matches:
+    - Enrich stream data with master data
+    - Insert into data warehouse
+    - Delete from hash table
+    - Remove from queue
+    - Increment w (free slots)
+```
+
+**Step 5: Repeat**
+```
+- Loop back to Step 2
+- Continue until stream ends and queue is empty
+```
+
+### Threading Model:
+
+**Producer Thread:**
+- Continuously reads transactional_data.csv
+- Adds tuples to stream buffer
+- Simulates real-time data arrival
+
+**Processor Thread:**
+- Implements HYBRIDJOIN algorithm
+- Performs stream-relation join
+- Enriches and loads data into DW
+- Uses locks for thread-safe access to shared structures
+
+### Performance Characteristics:
+
+- **Memory Usage**: Bounded by hash table size (10,000 slots)
+- **Throughput**: Processes tuples in batches (up to w at a time)
+- **Latency**: Near-real-time (small delay for batching)
+- **Fairness**: FIFO queue ensures older tuples processed first
+
+---
+
+## 4. Three Shortcomings of HYBRIDJOIN
+
+### Shortcoming 1: Hash Collisions and Performance Degradation
+
+**Issue**: The hash table uses a fixed number of slots (10,000) with a multi-map structure. When multiple stream tuples hash to the same slot, they form a linked list at that location. High collision rates degrade performance from O(1) to O(n) for lookups.
+
+**Impact**: 
+- Skewed data distributions cause clustering
+- Probe operations become slower as chains grow
+- Memory locality decreases with longer chains
+
+**Real-world Scenario**: If Walmart has popular Customer_IDs (e.g., loyalty program members who shop frequently), these will create long chains at specific slots, slowing down the join process.
+
+**Potential Solution**: Use better hash functions, increase table size, or implement dynamic resizing.
+
+### Shortcoming 2: Limited Handling of Bursty Streams
+
+**Issue**: While the stream buffer provides some buffering capacity, it has no explicit size limit in the algorithm specification. During extreme bursts (e.g., Black Friday sales), the buffer could grow unbounded, causing memory overflow.
+
+**Impact**:
+- Memory exhaustion during traffic spikes
+- Potential data loss if buffer isn't monitored
+- System instability under load
+
+**Real-world Scenario**: During Walmart's holiday sales or flash promotions, millions of transactions might arrive simultaneously, overwhelming the stream buffer.
+
+**Potential Solution**: Implement backpressure mechanisms, multiple processing threads, or dynamic resource allocation based on load.
+
+### Shortcoming 3: Inefficient Disk Access Patterns
+
+**Issue**: The algorithm loads disk partitions based on the oldest key in the queue, which may not align with disk storage organization. This can lead to random I/O patterns rather than sequential reads, especially when join keys are not uniformly distributed.
+
+**Impact**:
+- Poor disk I/O performance
+- Increased latency for partition loading
+- Inefficient use of disk cache
+
+**Real-world Scenario**: If customers from different geographic regions (different Customer_ID ranges) shop simultaneously, the algorithm will jump between non-contiguous disk blocks, reducing I/O throughput.
+
+**Potential Solution**: 
+- Pre-partition master data by hash value
+- Use SSD storage for random access
+- Implement prefetching based on queue lookahead
+- Batch similar keys before disk access
+
+---
+
+## 5. Implementation Highlights
+
+### Data Enrichment Process:
+1. Stream tuple contains: orderID, Customer_ID, Product_ID, quantity, date
+2. Join with customer master data adds: Gender, Age, Occupation, City_Category, Marital_Status
+3. Join with product master data adds: Product_Category, price, store info, supplier info
+4. Date dimension adds: day_of_week, quarter, season, is_weekend
+5. Enriched data inserted into fact_sales with calculated total_amount
+
+### OLAP Operations Supported:
+
+**Slicing**: Filter data by specific dimension values
+- Example: Sales for Gender = 'M' and City_Category = 'A'
+
+**Dicing**: Create sub-cube with multiple dimension constraints
+- Example: Sales for specific age groups, product categories, and quarters
+
+**Drill-Down**: Navigate from summary to detail
+- Example: Year → Quarter → Month → Day level analysis
+
+**Roll-Up**: Aggregate from detail to summary
+- Example: Daily sales → Monthly sales → Yearly sales
+
+**Materialized View**: Pre-computed aggregation for performance
+- Example: STORE_QUARTERLY_SALES view for quick store performance analysis
+
+---
+
+## 6. Analytical Insights Enabled
+
+The implemented DW supports comprehensive business intelligence including:
+
+1. **Revenue Analysis**: Top products, stores, and time periods
+2. **Customer Segmentation**: Demographics, behavior patterns, purchase trends
+3. **Product Performance**: Category analysis, seasonal trends, affinity analysis
+4. **Temporal Patterns**: Weekend vs weekday, monthly growth, quarterly trends
+5. **Supplier & Store Analytics**: Performance comparison, volatility analysis
+6. **Anomaly Detection**: Revenue spikes and outliers identification
+
+---
+
+## 7. Reflection and Learning Outcomes
+
+### Technical Skills Acquired:
+
+**1. Stream Processing Concepts**
+- Understanding real-time vs near-real-time systems
+- Buffer management and flow control
+- Thread synchronization and race condition prevention
+
+**2. Algorithm Implementation**
+- Translating theoretical algorithms into working code
+- Data structure design (hash tables, doubly-linked lists)
+- Performance optimization techniques
+
+**3. Data Warehousing Principles**
+- Star schema design and dimensional modeling
+- ETL processes and data enrichment
+- OLAP operations and analytical queries
+
+**4. Database Programming**
+- SQL schema design with constraints
+- Complex analytical queries with window functions
+- View creation and query optimization
+
+### Challenges Overcome:
+
+**1. Thread Synchronization**
+- Challenge: Coordinating producer and consumer threads
+- Solution: Used locks and thread-safe Queue for shared access
+
+**2. Data Quality**
+- Challenge: Handling missing or mismatched keys during joins
+- Solution: Implemented error handling and validation checks
+
+**3. Performance Tuning**
+- Challenge: Balancing memory usage with processing speed
+- Solution: Adjusted hash table size and partition size parameters
+
+**4. Complex Queries**
+- Challenge: Implementing advanced OLAP operations
+- Solution: Used window functions, CTEs, and ROLLUP operations
+
+### Practical Insights:
+
+1. **Real-world Applicability**: The project simulates actual enterprise DW scenarios, making it highly relevant for industry applications.
+
+2. **Scalability Considerations**: Understanding the tradeoffs between memory, disk I/O, and processing speed is crucial for production systems.
+
+3. **Algorithm Limitations**: No algorithm is perfect; recognizing shortcomings helps in choosing the right tool for specific scenarios.
+
+4. **Data Quality Importance**: The success of analytics depends heavily on clean, consistent master data.
+
+### Future Improvements:
+
+1. Implement distributed processing for horizontal scalability
+2. Add data quality checks and validation rules
+3. Create real-time dashboards for monitoring
+4. Implement incremental updates for dimension tables
+5. Add support for late-arriving data (slowly changing dimensions)
+
+---
+
+## 8. Conclusion
+
+This project successfully demonstrates the implementation of a near-real-time data warehouse using the HYBRIDJOIN algorithm. The system effectively integrates streaming transactional data with master data, enabling timely business insights through comprehensive OLAP operations. 
+
+The star schema design provides a robust foundation for multidimensional analysis, while the HYBRIDJOIN algorithm efficiently handles the stream-relation join challenge. Despite its shortcomings, the algorithm performs well for moderate data volumes and offers valuable insights into stream processing techniques.
+
+The project has provided hands-on experience with critical data engineering concepts including dimensional modeling, ETL processes, stream processing, and analytical query design - all essential skills for modern data professionals working with big data and real-time analytics systems.
